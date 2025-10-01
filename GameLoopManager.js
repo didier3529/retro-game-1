@@ -1,0 +1,130 @@
+const updateCallbacks = new Set();
+const renderCallbacks = new Set();
+
+class GameLoopManager {
+  constructor() {
+    this.isRunning = false;
+    this.isPaused = false;
+    this.lastTimestamp = 0;
+    this.accumulatedDelta = 0;
+    this.fixedStep = 1000 / 60;
+    this.maxDelta = 1000;
+    this.rafId = null;
+    this.tickCount = 0;
+    this.frameCount = 0;
+    this.fps = 0;
+    this.fpsLastTime = 0;
+    this.loop = this.loop.bind(this);
+  }
+
+  start() {
+    if (this.isRunning) return;
+    this.isRunning = true;
+    this.isPaused = false;
+    this.lastTimestamp = performance.now();
+    this.accumulatedDelta = 0;
+    this.tickCount = 0;
+    this.frameCount = 0;
+    this.fpsLastTime = this.lastTimestamp;
+    document.dispatchEvent(new CustomEvent('GameStart'));
+    this.rafId = requestAnimationFrame(this.loop);
+  }
+
+  loop(timestamp) {
+    if (!this.isRunning) return;
+    const delta = timestamp - this.lastTimestamp;
+    this.lastTimestamp = timestamp;
+    const clamped = Math.min(delta, this.maxDelta);
+    this.accumulatedDelta += clamped;
+
+    while (this.accumulatedDelta >= this.fixedStep) {
+      updateCallbacks.forEach(fn => {
+        try { fn(this.fixedStep); }
+        catch (e) { console.error('GameLoop update error', e); }
+      });
+      this.accumulatedDelta -= this.fixedStep;
+      this.tickCount++;
+    }
+
+    renderCallbacks.forEach(fn => {
+      try { fn(delta); }
+      catch (e) { console.error('GameLoop render error', e); }
+    });
+
+    this.frameCount++;
+    if (timestamp - this.fpsLastTime >= 1000) {
+      this.fps = (this.frameCount * 1000) / (timestamp - this.fpsLastTime);
+      this.fpsLastTime = timestamp;
+      this.frameCount = 0;
+    }
+
+    this.rafId = requestAnimationFrame(this.loop);
+  }
+
+  pause() {
+    if (!this.isRunning || this.isPaused) return;
+    this.isPaused = true;
+    this.isRunning = false;
+    if (this.rafId) cancelAnimationFrame(this.rafId);
+    document.dispatchEvent(new CustomEvent('GamePause'));
+    const viewport = document.getElementById('canvas-viewport');
+    const hud = document.getElementById('hud-container');
+    if (viewport) viewport.classList.add('is-paused');
+    if (hud) hud.classList.add('is-paused');
+  }
+
+  resume() {
+    if (this.isRunning || !this.isPaused) return;
+    this.isPaused = false;
+    this.isRunning = true;
+    this.lastTimestamp = performance.now();
+    this.fpsLastTime = this.lastTimestamp;
+    document.dispatchEvent(new CustomEvent('GameResume'));
+    const viewport = document.getElementById('canvas-viewport');
+    const hud = document.getElementById('hud-container');
+    if (viewport) viewport.classList.remove('is-paused');
+    if (hud) hud.classList.remove('is-paused');
+    this.rafId = requestAnimationFrame(this.loop);
+  }
+
+  stop() {
+    if (!this.isRunning && !this.isPaused) return;
+    this.isRunning = false;
+    this.isPaused = false;
+    if (this.rafId) cancelAnimationFrame(this.rafId);
+    document.dispatchEvent(new CustomEvent('GameOver'));
+  }
+
+  registerUpdate(fn) {
+    if (typeof fn === 'function') updateCallbacks.add(fn);
+  }
+
+  registerRender(fn) {
+    if (typeof fn === 'function') renderCallbacks.add(fn);
+  }
+
+  unregisterUpdate(fn) {
+    updateCallbacks.delete(fn);
+  }
+
+  unregisterRender(fn) {
+    renderCallbacks.delete(fn);
+  }
+
+  dispose() {
+    this.stop();
+    updateCallbacks.clear();
+    renderCallbacks.clear();
+  }
+
+  getCurrentFPS() {
+    return this.fps;
+  }
+
+  getTickCount() {
+    return this.tickCount;
+  }
+}
+
+const gameloopmanager = new GameLoopManager();
+export default gameloopmanager;
