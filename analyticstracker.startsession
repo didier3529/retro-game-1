@@ -1,0 +1,79 @@
+let sessionStarted = false
+let currentSessionId = null
+let sessionStartTimestamp = null
+const { samplingRate = 1.0, environment = 'production' } = window.ANALYTICS_CONFIG || {}
+
+export async function startSession({ userId: id, context = {} } = {}) {
+    if (sessionStarted) return currentSessionId
+    sessionStarted = true
+    if (id) identifyUser(id)
+    sessionStartTimestamp = new Date().toISOString()
+    currentSessionId = generateUUID()
+    const sanitizedContext = sanitizeContext(context)
+    const payload = {
+        event: 'SessionStart',
+        sessionId: currentSessionId,
+        userId: id,
+        timestamp: sessionStartTimestamp,
+        context: sanitizedContext,
+        metadata: {
+            environment,
+            samplingRate,
+            listeners: getTotalListeners()
+        }
+    }
+    try {
+        localStorage.setItem('analytics_session', JSON.stringify({
+            sessionId: currentSessionId,
+            timestamp: sessionStartTimestamp
+        }))
+    } catch (_) {}
+    dispatchImmediate(payload)
+    enqueueEvent('SessionStart', { sessionId: currentSessionId, context: sanitizedContext })
+    window.dispatchEvent(new CustomEvent('AnalyticsSessionStarted', { detail: { sessionId: currentSessionId } }))
+    window.dispatchEvent(new Event('AnalyticsReady'))
+    return currentSessionId
+}
+
+function dispatchImmediate(payload, retries = 3, delay = 1000) {
+    const send = async () => {
+        try {
+            const body = JSON.stringify(payload)
+            if (navigator.sendBeacon) {
+                navigator.sendBeacon(ANALYTICS_ENDPOINT, body)
+            } else {
+                await fetch(ANALYTICS_ENDPOINT, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body
+                })
+            }
+        } catch (err) {
+            if (retries > 0) {
+                setTimeout(() => dispatchImmediate(payload, retries - 1, delay * 2), delay)
+            } else {
+                console.error('Analytics startSession dispatch failed', err)
+                window.dispatchEvent(new CustomEvent('AnalyticsError', { detail: err }))
+            }
+        }
+    }
+    send()
+}
+
+function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = Math.random() * 16 | 0
+        const v = c === 'x' ? r : (r & 0x3 | 0x8)
+        return v.toString(16)
+    })
+}
+
+function sanitizeContext(ctx) {
+    const safe = {}
+    for (const key in ctx) {
+        if (!/email|phone|address|ssn|dob/i.test(key)) {
+            safe[key] = ctx[key]
+        }
+    }
+    return safe
+}
