@@ -1,0 +1,75 @@
+loadAll(manifestOrOptions) {
+  const overlay = document.querySelector('#loading-overlay');
+  if (overlay) overlay.classList.add('is-loading');
+  return new Promise(async (resolve, reject) => {
+    try {
+      let rawManifest;
+      if (Array.isArray(manifestOrOptions)) rawManifest = manifestOrOptions;
+      else if (typeof manifestOrOptions === 'string') {
+        const resp = await fetch(manifestOrOptions);
+        if (!resp.ok) throw new Error(`AssetManager: Failed to fetch manifest ${resp.status}`);
+        rawManifest = await resp.json();
+      } else if (manifestOrOptions && manifestOrOptions.manifest) rawManifest = manifestOrOptions.manifest;
+      else if (manifestOrOptions && manifestOrOptions.manifestUrl) {
+        const resp = await fetch(manifestOrOptions.manifestUrl);
+        if (!resp.ok) throw new Error(`AssetManager: Failed to fetch manifest ${resp.status}`);
+        rawManifest = await resp.json();
+      } else if (this.manifest.length) rawManifest = this.manifest;
+      else throw new Error('AssetManager: No manifest to load');
+      let descriptors = [];
+      if (Array.isArray(rawManifest)) {
+        rawManifest.forEach(item => {
+          let url, key, deps = [];
+          if (typeof item === 'string') { url = item; key = item; }
+          else { url = item.url; key = item.key || item.url; deps = item.dependencies || []; }
+          const type = (item && item.type) || this._deduceType(url);
+          descriptors.push({ key, url, type, dependencies: deps });
+        });
+      } else {
+        Object.entries(rawManifest).forEach(([k, v]) => {
+          let url, deps = [];
+          if (typeof v === 'string') url = v;
+          else { url = v.url; deps = v.dependencies || []; }
+          const type = (v && v.type) || this._deduceType(url);
+          descriptors.push({ key: k, url, type, dependencies: deps });
+        });
+      }
+      if (manifestOrOptions && manifestOrOptions.include) {
+        const inc = new RegExp(manifestOrOptions.include);
+        descriptors = descriptors.filter(d => inc.test(d.url) || inc.test(d.key));
+      }
+      if (manifestOrOptions && manifestOrOptions.exclude) {
+        const exc = new RegExp(manifestOrOptions.exclude);
+        descriptors = descriptors.filter(d => !(exc.test(d.url) || exc.test(d.key)));
+      }
+      const map = new Map(descriptors.map(d => [d.key, d]));
+      const visited = new Set(), temp = new Set(), sorted = [];
+      const visit = key => {
+        if (temp.has(key)) { console.warn(`AssetManager: cyclic dependency ${key}`); return; }
+        if (!visited.has(key)) {
+          temp.add(key);
+          const node = map.get(key);
+          if (node && Array.isArray(node.dependencies))
+            node.dependencies.forEach(dep => map.has(dep) && visit(dep));
+          temp.delete(key);
+          visited.add(key);
+          if (node) sorted.push(node);
+        }
+      };
+      descriptors.forEach(d => visit(d.key));
+      this.manifest = sorted;
+      this._queue = [...this.manifest];
+      this._total = this._queue.length;
+      this._loaded = 0;
+      const finish = () => {
+        if (overlay) overlay.classList.remove('is-loading');
+        document.dispatchEvent(new Event('AssetsReady'));
+        resolve();
+      };
+      for (let i = 0; i < this.options.concurrency; i++) this._next(finish);
+    } catch (err) {
+      if (overlay) overlay.classList.remove('is-loading');
+      reject(err);
+    }
+  });
+}
