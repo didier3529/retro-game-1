@@ -1,0 +1,76 @@
+import { enqueueEvent, flushQueue, userId } from './AnalyticsTracker.js';
+import storagemanager from './StorageManager.js';
+
+const FALLBACK_KEY = 'analytics_offline_queue';
+const MAX_RETRIES = 3;
+const INITIAL_BACKOFF = 1000;
+
+let sessionState = {
+    id: null,
+    startTimestamp: null,
+    active: false
+};
+
+export function __setSessionState(id, startTimestamp) {
+    sessionState = { id, startTimestamp, active: true };
+}
+
+export async function endSession(sessionId = null, timestamp = null, metadata = {}) {
+    if (!sessionState.active) {
+        return Promise.reject(new Error('AnalyticsTracker.endSession: no active session to end'));
+    }
+    const id = sessionId || sessionState.id;
+    if (id !== sessionState.id) {
+        return Promise.reject(new Error('AnalyticsTracker.endSession: session ID mismatch or duplicate call'));
+    }
+    const endTs = timestamp || Date.now();
+    if (endTs < sessionState.startTimestamp) {
+        return Promise.reject(new Error('AnalyticsTracker.endSession: end timestamp precedes start timestamp'));
+    }
+    const duration = endTs - sessionState.startTimestamp;
+    const payload = {
+        event: 'SessionEnd',
+        sessionId: id,
+        startTimestamp: sessionState.startTimestamp,
+        endTimestamp: endTs,
+        duration,
+        userContext: {
+            userId,
+            userAgent: navigator.userAgent,
+            platform: navigator.platform,
+            language: navigator.language
+        },
+        metadata
+    };
+    try {
+        const raw = localStorage.getItem(FALLBACK_KEY);
+        const queue = raw ? JSON.parse(raw) : [];
+        queue.push(payload);
+        localStorage.setItem(FALLBACK_KEY, JSON.stringify(queue));
+    } catch (e) {
+        console.debug('AnalyticsTracker: fallback storage failed', e);
+    }
+    enqueueEvent(payload);
+    let backoff = INITIAL_BACKOFF;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            await flushQueue();
+            await storagemanager.commitAll();
+            localStorage.removeItem(FALLBACK_KEY);
+            break;
+        } catch (e) {
+            console.debug(`AnalyticsTracker.endSession flush attempt ${attempt + 1} failed`, e);
+            if (attempt === MAX_RETRIES) {
+                console.error('AnalyticsTracker: endSession failed after max retries');
+            } else {
+                await new Promise(res => setTimeout(res, backoff));
+                backoff *= 2;
+            }
+        }
+    }
+    sessionState.active = false;
+    sessionState.id = null;
+    sessionState.startTimestamp = null;
+    document.dispatchEvent(new CustomEvent('SessionEnd', { detail: payload }));
+    return payload;
+}
