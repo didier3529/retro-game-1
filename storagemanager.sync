@@ -1,0 +1,122 @@
+async sync() {
+    // Define sync objectives: multi-platform (browser fallback), JSON data, sub-100ms local load
+    // Client?server push/pull model via REST, last-write-wins conflict resolution, exponential backoff
+    const REMOTE_SYNC_URL = (window.CONFIG && window.CONFIG.storageSyncUrl) || '/api/storage/sync';
+    const MAX_RETRIES = 5;
+    const MAX_BACKOFF = 30000;
+    // initialize metadata
+    if (!this.keyTimestamps) this.keyTimestamps = {};
+    if (this.syncInProgress === undefined) this.syncInProgress = false;
+    if (this.lastSyncTime === undefined) this.lastSyncTime = 0;
+    if (this.syncInterval === undefined) this.syncInterval = 60000;
+    if (this.retryCount === undefined) this.retryCount = 0;
+    const now = Date.now();
+    if (this.syncInProgress || now - this.lastSyncTime < this.syncInterval) {
+        this.dispatchEvent(new CustomEvent('StorageReady'));
+        return;
+    }
+    this.syncInProgress = true;
+    this.lastSyncTime = now;
+    let mergedKeys = new Set();
+    try {
+        // Load local storage and apply migrations
+        if (this.supported) {
+            const storedVersionRaw = this.storage.getItem(this.versionKey);
+            let storedVersion = parseInt(storedVersionRaw, 10);
+            if (isNaN(storedVersion)) storedVersion = 0;
+            for (let i = 0; i < this.storage.length; i++) {
+                const key = this.storage.key(i);
+                if (key === this.versionKey) continue;
+                const raw = this.storage.getItem(key);
+                try { this.cache[key] = JSON.parse(raw); }
+                catch { this.cache[key] = raw; }
+            }
+            if (storedVersion < this.currentVersion) {
+                for (let v = storedVersion + 1; v <= this.currentVersion; v++) {
+                    const migrate = this.migrations[v];
+                    if (typeof migrate === 'function') migrate(this.cache);
+                }
+                this.cache[this.versionKey] = this.currentVersion;
+                this.buffer[this.versionKey] = this.currentVersion;
+            }
+        }
+    } catch (e) {
+        this.supported = false;
+        this.dispatchEvent(new CustomEvent('StorageError', { detail: e }));
+    }
+    // restore local timestamps
+    if (this.cache['__timestamps'] && typeof this.cache['__timestamps'] === 'object') {
+        this.keyTimestamps = Object.assign({}, this.cache['__timestamps']);
+    }
+    // Pull remote data
+    let remoteData = {};
+    try {
+        if (navigator.onLine) {
+            const resp = await fetch(REMOTE_SYNC_URL, { method: 'GET', credentials: 'include', headers: { 'Accept': 'application/json' } });
+            if (resp.ok) {
+                const payload = await resp.json();
+                remoteData = payload.data || {};
+            }
+        }
+    } catch (e) {
+        console.warn('StorageManager.sync: remote pull failed', e);
+    }
+    // Merge local and remote with last-write-wins
+    const toPush = {};
+    const allKeys = new Set([...Object.keys(this.cache), ...Object.keys(remoteData)]);
+    allKeys.forEach(key => {
+        if (key === '__timestamps' || key === this.versionKey) return;
+        const localTs = this.keyTimestamps[key] || 0;
+        const remoteEntry = remoteData[key] || {};
+        const remoteTs = typeof remoteEntry.ts === 'number' ? remoteEntry.ts : 0;
+        const remoteVal = remoteEntry.value;
+        if (remoteTs > localTs) {
+            // remote wins
+            this.cache[key] = remoteVal;
+            this.keyTimestamps[key] = remoteTs;
+            toPush[key] = remoteVal; // ensure local persistence
+        } else if (localTs > remoteTs) {
+            // local wins
+            toPush[key] = this.cache[key];
+        }
+        mergedKeys.add(key);
+    });
+    // persist merged local state
+    this.cache['__timestamps'] = this.keyTimestamps;
+    this.buffer['__timestamps'] = this.keyTimestamps;
+    mergedKeys.forEach(key => {
+        this.buffer[key] = this.cache[key];
+    });
+    try {
+        await this.commitAll();
+        this.dispatchEvent(new CustomEvent('StorageCommitted'));
+    } catch (e) {
+        console.error('StorageManager.sync: commitAll failed', e);
+        this.dispatchEvent(new CustomEvent('StorageError', { detail: e }));
+    }
+    // Push local changes to remote
+    if (navigator.onLine && Object.keys(toPush).length) {
+        try {
+            await fetch(REMOTE_SYNC_URL, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ data: Object.entries(toPush).map(([k,v]) => ({ key: k, value: v, ts: this.keyTimestamps[k] })) })
+            });
+            this.retryCount = 0;
+        } catch (e) {
+            console.warn('StorageManager.sync: remote push failed', e);
+            if (this.retryCount < MAX_RETRIES) {
+                const backoff = Math.min(1000 * 2 ** this.retryCount, MAX_BACKOFF);
+                this.retryCount++;
+                setTimeout(() => this.sync(), backoff);
+            }
+        }
+    }
+    // schedule retry on reconnect
+    if (!navigator.onLine) {
+        window.addEventListener('online', () => this.sync(), { once: true, passive: true });
+    }
+    this.syncInProgress = false;
+    this.dispatchEvent(new CustomEvent('StorageReady'));
+}
