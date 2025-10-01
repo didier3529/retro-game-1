@@ -1,0 +1,85 @@
+async load() {
+    if (this._loadPromise) return this._loadPromise;
+    this._loadPromise = (async () => {
+        performance.mark('settings-load-start');
+        const parserRegistry = {
+            json: JSON.parse,
+            yaml: window.YAML?.parse,
+            toml: window.TOML?.parse
+        };
+        const merged = {};
+        const mergeLayer = (layer) => {
+            if (!layer || typeof layer !== 'object') return;
+            for (const key in layer) {
+                if (key in this._schema) merged[key] = layer[key];
+            }
+        };
+        const castValue = (val, type) => {
+            if (type === 'number') { const n = parseFloat(val); return isNaN(n) ? val : n; }
+            if (type === 'boolean') return val === 'true' || val === true;
+            return val;
+        };
+        const redact = (key, val) => /password|secret|token/i.test(key) ? '[REDACTED]' : val;
+        // defaults
+        for (const key in this._schema) merged[key] = this._clone(this._schema[key].default);
+        // config file
+        try {
+            const cfgFile = window.CONFIG?.settingsFile;
+            if (cfgFile) {
+                const ext = cfgFile.split('.').pop().toLowerCase();
+                const resp = await fetch(cfgFile);
+                if (resp.ok) {
+                    const text = await resp.text();
+                    const parser = parserRegistry[ext] || parserRegistry.json;
+                    mergeLayer(parser(text));
+                }
+            }
+        } catch (e) {
+            console.warn('SettingsManager: config file load failed', e);
+        }
+        // environment vars
+        mergeLayer(window.CONFIG?.envSettings);
+        // remote store
+        try {
+            const resp = await fetch('/api/settings');
+            if (resp.ok) mergeLayer(await resp.json());
+        } catch (e) {
+            console.warn('SettingsManager: remote settings load failed', e);
+        }
+        // storage manager sync
+        await storagemanager.sync();
+        // command-line flags (URL query)
+        try {
+            const params = new URLSearchParams(window.location.search);
+            for (const [key, val] of params.entries()) {
+                if (key in this._schema) merged[key] = castValue(val, this._schema[key].type);
+            }
+        } catch {}
+        // validate and assign
+        for (const key in this._schema) {
+            const entry = this._schema[key];
+            const val = merged[key];
+            let ok = true;
+            if (entry.validate && !entry.validate(val)) ok = false;
+            else if (typeof val !== entry.type) ok = false;
+            if (!ok) {
+                console.error(`SettingsManager: validation failed for "${key}"`, redact(key, val));
+                this._settings[key] = this._clone(entry.default);
+            } else {
+                this._settings[key] = this._clone(val);
+            }
+        }
+        performance.mark('settings-load-end');
+        performance.measure('settings-load', 'settings-load-start', 'settings-load-end');
+        window.dispatchEvent(new CustomEvent('SettingsReady', { detail: { keys: Object.keys(this._settings) } }));
+        return this._settings;
+    })();
+    return this._loadPromise;
+}
+
+async save(updatedSettings) {
+    if (updatedSettings && typeof updatedSettings === 'object') {
+        Object.assign(this._settings, updatedSettings);
+    }
+    await storagemanager.commitAll();
+}
