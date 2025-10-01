@@ -1,0 +1,240 @@
+import express from 'express'
+import jwt from 'jsonwebtoken'
+import rateLimit from 'express-rate-limit'
+import { Counter, Histogram } from 'prom-client'
+import winston from 'winston'
+import db from '../db.js'
+import redisClient from '../redisClient.js'
+import { EventEmitter } from 'events'
+
+const router = express.Router()
+
+// metrics
+const submissionCounter = new Counter({ name: 'lb_submit_requests_total', help: 'Total submitScore requests' })
+const errorCounter = new Counter({ name: 'lb_submit_errors_total', help: 'Total submitScore errors', labelNames: ['code'] })
+const latencyHistogram = new Histogram({ name: 'lb_submit_latency_seconds', help: 'Latency of submitScore handler' })
+
+// event emitter for score submissions and leaderboard readiness
+const eventEmitter = new EventEmitter()
+
+const MAX_SCORE = 10000000
+const MIN_INTERVAL_MS = 5000
+
+// rate limiter per user
+const limiter = rateLimit({
+  windowMs: 60 * 1000, max: 5,
+  keyGenerator: req => {
+    try { const token = req.headers.authorization?.split(' ')[1]; const payload = jwt.verify(token, process.env.JWT_SECRET); return payload.sub }
+    catch { return req.ip }
+  },
+  handler: (req, res) => res.status(429).json({ error: 'Too many requests' })
+})
+
+async function authenticate(req, res, next) {
+  const auth = req.headers.authorization
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' })
+  const token = auth.slice(7)
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET)
+    req.userId = payload.sub
+    next()
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' })
+  }
+}
+
+/**
+ * @openapi
+ * /api/leaderboards/submit:
+ *   post:
+ *     summary: Submit a new leaderboard score
+ *     tags:
+ *       - leaderboards
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: header
+ *         name: Idempotency-Key
+ *         schema:
+ *           type: string
+ *         description: Unique key for idempotent requests
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               score:
+ *                 type: number
+ *             required:
+ *               - score
+ *     responses:
+ *       '200':
+ *         description: Submission result
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 updated:
+ *                   type: boolean
+ *                 rank:
+ *                   type: number
+ *       '400':
+ *         description: Invalid input parameters
+ *       '401':
+ *         description: Unauthorized
+ *       '429':
+ *         description: Too many requests or submission too frequent
+ *       '500':
+ *         description: Server error
+ */
+router.post('/submit', limiter, authenticate, async (req, res) => {
+  const startTime = Date.now()
+  submissionCounter.inc()
+  const idempotencyKey = req.headers['idempotency-key'] || null
+  const userId = req.userId
+  const score = Number(req.body.score)
+  if (!userId || typeof score !== 'number' || !isFinite(score)) {
+    errorCounter.inc({ code: '400' })
+    return res.status(400).json({ error: 'Invalid userId or score' })
+  }
+  if (score < 0 || score > MAX_SCORE) {
+    errorCounter.inc({ code: '400' })
+    return res.status(400).json({ error: 'Score out of range' })
+  }
+  try {
+    const last = await db('leaderboard')
+      .where({ userId })
+      .select('timestamp')
+      .orderBy('timestamp', 'desc')
+      .first()
+    if (last && Date.now() - new Date(last.timestamp).getTime() < MIN_INTERVAL_MS) {
+      errorCounter.inc({ code: '429' })
+      return res.status(429).json({ error: 'Submissions too frequent' })
+    }
+    if (idempotencyKey) {
+      const seen = await db('submissions').where({ userId, idempotencyKey }).first()
+      if (seen) {
+        const rank = await db('leaderboard').count('* as cnt').where('score', '>', seen.score).first().then(r => r.cnt + 1)
+        return res.status(200).json({ success: true, updated: false, rank })
+      }
+    }
+    await db.transaction(async trx => {
+      const row = await trx('leaderboard').where({ userId }).forUpdate().first()
+      let updated = false
+      let newVersion = 1
+      if (!row) {
+        await trx('leaderboard').insert({ userId, score, timestamp: trx.fn.now(), version: 1 })
+        updated = true
+      } else if (score > row.score) {
+        newVersion = row.version + 1
+        await trx('leaderboard')
+          .where({ userId })
+          .update({ score, timestamp: trx.fn.now(), version: newVersion })
+        updated = true
+      }
+      if (idempotencyKey) {
+        await trx('submissions').insert({ userId, idempotencyKey, score, timestamp: trx.fn.now() })
+      }
+      const cnt = await trx('leaderboard').count('* as cnt').where('score', '>', Math.max(score, row?.score || 0)).first()
+      const rank = cnt.cnt + 1
+      eventEmitter.emit('ScoreSubmitted', { userId, score, rank })
+      await redisClient.del(`leaders:*`)
+      await redisClient.del(`rank:${userId}`)
+      res.status(200).json({ success: true, updated, rank })
+    })
+  } catch (err) {
+    winston.error('submitScore error', err)
+    errorCounter.inc({ code: '500' })
+    res.status(500).json({ error: 'Internal server error' })
+  } finally {
+    latencyHistogram.observe((Date.now() - startTime) / 1000)
+  }
+})
+
+/**
+ * @openapi
+ * /api/leaderboards:
+ *   get:
+ *     summary: Get leaderboard entries
+ *     tags:
+ *       - leaderboards
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 10
+ *         description: Number of entries to return
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *         description: Starting offset
+ *     responses:
+ *       '200':
+ *         description: Leaderboard entries
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 leaders:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       userId:
+ *                         type: string
+ *                       score:
+ *                         type: number
+ *                       rank:
+ *                         type: number
+ *       '400':
+ *         description: Invalid parameters
+ *       '401':
+ *         description: Unauthorized
+ *       '429':
+ *         description: Too many requests
+ *       '500':
+ *         description: Server error
+ */
+router.get('/leaders', limiter, authenticate, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 10
+    const offset = parseInt(req.query.offset, 10) || 0
+    if (limit < 1 || offset < 0) {
+      return res.status(400).json({ error: 'Invalid limit or offset' })
+    }
+    const cacheKey = `leaders:${limit}:${offset}`
+    let data = await redisClient.get(cacheKey)
+    let leaders
+    if (data) {
+      leaders = JSON.parse(data)
+    } else {
+      const rows = await db('leaderboard')
+        .select('userId', 'score')
+        .orderBy('score', 'desc')
+        .limit(limit)
+        .offset(offset)
+      leaders = rows.map((r, i) => ({ userId: r.userId, score: r.score, rank: offset + i + 1 }))
+      await redisClient.set(cacheKey, JSON.stringify(leaders), 'EX', 60)
+    }
+    eventEmitter.emit('LeaderboardReady', { leaders, limit, offset })
+    res.json({ success: true, leaders })
+  } catch (err) {
+    winston.error('getLeaders error', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+export default router
