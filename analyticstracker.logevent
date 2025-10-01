@@ -1,0 +1,98 @@
+import eventBus from './eventBus';
+
+const ANALYTICS_ENDPOINT = '/api/analytics';
+const MAX_BATCH_SIZE = 20;
+const FLUSH_INTERVAL = 5000;
+
+let eventQueue = [];
+let flushTimer = null;
+let userId = null;
+let optedOut = false;
+
+function isValidEventName(name) {
+    return typeof name === 'string' && name.trim().length > 0;
+}
+
+function sanitizeProperties(obj) {
+    if (obj == null || typeof obj !== 'object') return {};
+    try {
+        return JSON.parse(JSON.stringify(obj));
+    } catch {
+        return {};
+    }
+}
+
+function scheduleFlush() {
+    if (flushTimer || !eventQueue.length) return;
+    flushTimer = setTimeout(flushQueue, FLUSH_INTERVAL);
+}
+
+async function flushQueue() {
+    if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+    }
+    if (!eventQueue.length) return;
+    if (!navigator.onLine) {
+        window.addEventListener('online', flushQueue, { once: true });
+        return;
+    }
+    const batch = eventQueue.splice(0, MAX_BATCH_SIZE);
+    const payload = {
+        events: batch,
+        userId,
+        queuedAt: new Date().toISOString()
+    };
+    const body = JSON.stringify(payload);
+    try {
+        if (navigator.sendBeacon) {
+            navigator.sendBeacon(ANALYTICS_ENDPOINT, body);
+        } else {
+            const res = await fetch(ANALYTICS_ENDPOINT, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        }
+        eventBus.emit('AnalyticsFlushed', batch);
+    } catch (error) {
+        console.error('logEvent flush failed:', error);
+        eventBus.emit('AnalyticsFlushFailed', error);
+        eventQueue = batch.concat(eventQueue);
+        setTimeout(flushQueue, FLUSH_INTERVAL);
+    }
+}
+
+export function logEvent(name, data = {}) {
+    if (optedOut) return false;
+    if (!isValidEventName(name)) {
+        console.error('logEvent: invalid event name:', name);
+        return false;
+    }
+    const timestamp = new Date().toISOString();
+    const properties = sanitizeProperties(data);
+    const event = { name: name.trim(), properties, timestamp };
+    if (userId) event.userId = userId;
+    eventQueue.push(event);
+    if (eventQueue.length >= MAX_BATCH_SIZE) {
+        flushQueue();
+    } else {
+        scheduleFlush();
+    }
+    eventBus.emit('EventQueued', event);
+    return true;
+}
+
+export function identifyUser(id) {
+    if (typeof id === 'string' && id.trim()) {
+        userId = id.trim();
+        return true;
+    }
+    console.error('identifyUser: invalid userId');
+    return false;
+}
+
+export function setOptOut(flag) {
+    optedOut = !!flag;
+}
