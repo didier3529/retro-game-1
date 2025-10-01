@@ -1,0 +1,104 @@
+show(screenId, props = {}, options = {}) {
+  return new Promise((resolve, reject) => {
+    if (typeof screenId !== 'string' || !screenId) {
+      reject(new Error('UIManager.show: screenId must be a non-empty string'));
+      return;
+    }
+    if (!this.allowedScreens.has(screenId)) {
+      console.warn(`UIManager: Unknown screen "${screenId}"`);
+      reject(new Error(`Unknown screenId: ${screenId}`));
+      return;
+    }
+    if (!this.screenElements) {
+      this.screenElements = new Map();
+      this._focusTraps = {};
+      document.querySelectorAll('.menu-screen[data-screen]').forEach(el => {
+        el.setAttribute('role', 'tabpanel'); // id4: ARIA consistency
+        this.screenElements.set(el.dataset.screen, el);
+      });
+    }
+    const target = this.screenElements.get(screenId);
+    if (!target) {
+      console.error(`UIManager.show: Element for screen "${screenId}" not found`);
+      reject(new Error(`Element not found for screenId: ${screenId}`));
+      return;
+    }
+    const previous = this.currentScreen;
+    const loadComponent = (target.dataset.lazy === 'true' && !target.hasAttribute('data-loaded'))
+      ? import(`./${screenId}UI.js`).then(mod => {
+          if (typeof mod.default === 'function') mod.default(target, props);
+          target.setAttribute('data-loaded', 'true');
+        })
+      : Promise.resolve();
+    loadComponent.then(() => {
+      // id1: ensure grid-container wrapper
+      const parent = target.parentElement;
+      if (parent && !parent.classList.contains('grid-container')) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'grid-container';
+        parent.insertBefore(wrapper, target);
+        wrapper.appendChild(target);
+      }
+      if (previous && previous !== screenId) {
+        const prevEl = this.screenElements.get(previous);
+        if (prevEl) {
+          const exitCls = options.animation?.exitClass || 'fade-out';
+          prevEl.classList.add(exitCls);
+          prevEl.setAttribute('aria-hidden', 'true');
+          prevEl.classList.remove('is-active');
+          prevEl.addEventListener('animationend', () => {
+            prevEl.classList.remove(exitCls);
+          }, { once: true });
+        }
+      }
+      let backdropEl;
+      if (options.backdrop) {
+        if (!this.backdrop) {
+          backdropEl = document.createElement('div');
+          backdropEl.className = 'ui-backdrop';
+          backdropEl.setAttribute('tabindex', '-1');
+          document.body.appendChild(backdropEl);
+          this.backdrop = backdropEl;
+        } else backdropEl = this.backdrop;
+        backdropEl.classList.add('is-active');
+      }
+      const enterCls = options.animation?.enterClass || 'fade-in';
+      target.classList.add('is-active', enterCls);
+      target.setAttribute('aria-hidden', 'false');
+      target.setAttribute('role', options.role || 'tabpanel');
+      if (options.theme) target.dataset.theme = options.theme;
+      const toFocus = target.querySelector('[data-autofocus]') || target;
+      toFocus.focus({ preventScroll: true });
+      target.addEventListener('animationend', () => {
+        target.classList.remove(enterCls);
+        this.currentScreen = screenId;
+        // id3: align event name with contract
+        window.dispatchEvent(new CustomEvent('NavigateComplete', { detail: { screenId, props, options } }));
+        resolve();
+      }, { once: true });
+      if (options.focusTrap) {
+        const focusable = Array.from(target.querySelectorAll('a[href], button, textarea, input, select, [tabindex]:not([tabindex="-1"])'));
+        if (focusable.length) {
+          const first = focusable[0], last = focusable[focusable.length - 1];
+          const trap = e => {
+            if (e.key === 'Tab') {
+              if (e.shiftKey && document.activeElement === first) {
+                e.preventDefault();
+                last.focus();
+              } else if (!e.shiftKey && document.activeElement === last) {
+                e.preventDefault();
+                first.focus();
+              }
+            }
+            if (e.key === 'Escape' && options.escapeToClose && typeof this.hide === 'function') {
+              this.hide(screenId);
+            }
+          };
+          target.addEventListener('keydown', trap);
+          // id2: store focus-trap handler per screen
+          this._focusTraps[screenId] = trap;
+        }
+      }
+    }).catch(err => reject(err));
+  });
+}
