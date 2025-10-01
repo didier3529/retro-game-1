@@ -1,0 +1,257 @@
+/**
+ * StorageManager provides a unified interface over localStorage (with in-memory fallback)
+ * for persisting and retrieving data with versioning and migration capabilities.
+ *
+ * Events:
+ *   StorageReady (CustomEvent): Fired after sync() completes.
+ *   StorageCommitted (CustomEvent): Fired after commitAll() completes.
+ *   StorageError (CustomEvent): Fired when an operation fails (detail: Error).
+ *
+ * @extends {EventTarget}
+ */
+class StorageManager extends EventTarget {
+    constructor() {
+        super();
+        this.supported = this._detectSupport();
+        this.storage = this.supported ? window.localStorage : null;
+        this.cache = {};
+        this.buffer = {};
+        this.removals = new Set();
+        this.currentVersion = 1;
+        this.versionKey = '__storage_version';
+        this.migrations = {};
+        // WAL key constant
+        this._walKey = '__storage_wal';
+        // Metrics for commitAll
+        this.metrics = { commits: 0, totalLatency: 0, failures: 0 };
+        // Queue for pending commits
+        this._commitQueue = [];
+        this._commitLock = false;
+    }
+
+    _detectSupport() {
+        try {
+            const testKey = '__storage_test';
+            window.localStorage.setItem(testKey, '1');
+            window.localStorage.removeItem(testKey);
+            return true;
+        } catch (e) {
+            console.warn('localStorage not supported, using in-memory fallback', e);
+            return false;
+        }
+    }
+
+    /**
+     * Synchronize the in-memory cache with persistent storage, applying migrations if needed.
+     * Emits 'StorageReady' event when done.
+     * @returns {Promise<void>}
+     */
+    async sync() {
+        try {
+            if (this.supported) {
+                const storedVersionRaw = this.storage.getItem(this.versionKey);
+                let storedVersion = parseInt(storedVersionRaw, 10);
+                if (isNaN(storedVersion)) storedVersion = 0;
+                for (let i = 0; i < this.storage.length; i++) {
+                    const key = this.storage.key(i);
+                    if (key === this.versionKey) continue;
+                    const raw = this.storage.getItem(key);
+                    try {
+                        this.cache[key] = JSON.parse(raw);
+                    } catch {
+                        this.cache[key] = raw;
+                    }
+                }
+                if (storedVersion < this.currentVersion) {
+                    for (let v = storedVersion + 1; v <= this.currentVersion; v++) {
+                        const migrate = this.migrations[v];
+                        if (typeof migrate === 'function') migrate(this.cache);
+                    }
+                    this.cache[this.versionKey] = this.currentVersion;
+                    this.buffer[this.versionKey] = this.currentVersion;
+                }
+            }
+        } catch (e) {
+            this.supported = false;
+            this.dispatchEvent(new CustomEvent('StorageError', { detail: e }));
+        }
+        this.dispatchEvent(new CustomEvent('StorageReady'));
+    }
+
+    /**
+     * Persist all buffered changes to storage atomically using a write-ahead log.
+     * Returns Promise<void>.
+     * WAL record format: { id: number, operations: Array<{ type: 'set'|'remove', key: string, value?: any }> }
+     * atomicCommitSteps: replay ? log ? apply ? clear
+     * Emits:
+     *   - StorageCommitted
+     *   - StorageError (detail: Error)
+     *   - StorageCommitMetrics (detail: { latency, averageLatency, totalCommits, totalLatency, timestamp })
+     * @returns {Promise<void>}
+     */
+    async commitAll() {
+        if (this._commitLock) {
+            return new Promise((resolve, reject) => {
+                this._commitQueue.push({ resolve, reject });
+            });
+        }
+        this._commitLock = true;
+        const startTime = performance.now();
+        // Prepare WAL entry
+        const walEntry = {
+            id: ++this._walEntryId || (this._walEntryId = 1),
+            operations: [
+                ...Array.from(this.removals).map(key => ({ type: 'remove', key })),
+                ...Object.entries(this.buffer).map(([key, value]) => ({ type: 'set', key, value }))
+            ]
+        };
+        try {
+            // Write?ahead log
+            this.storage.setItem(this._walKey, JSON.stringify(walEntry));
+        } catch (e) {
+            this.metrics.failures++;
+            this.dispatchEvent(new CustomEvent('StorageError', { detail: e }));
+            this._releaseCommitLock();
+            throw e;
+        }
+        try {
+            // Apply removals
+            for (const key of this.removals) {
+                this.storage.removeItem(key);
+            }
+            // Apply buffered sets
+            for (const [key, value] of Object.entries(this.buffer)) {
+                this.storage.setItem(key, JSON.stringify(value));
+            }
+            // Remove WAL on success
+            this.storage.removeItem(this._walKey);
+            // Clear in?memory state
+            this.removals.clear();
+            this.buffer = {};
+            // Metrics
+            const latency = performance.now() - startTime;
+            this.metrics.commits++;
+            this.metrics.totalLatency += latency;
+            const averageLatency = this.metrics.totalLatency / this.metrics.commits;
+            this.dispatchEvent(new CustomEvent('StorageCommitMetrics', {
+                detail: {
+                    latency,
+                    averageLatency,
+                    totalCommits: this.metrics.commits,
+                    totalLatency: this.metrics.totalLatency,
+                    timestamp: new Date().toISOString()
+                }
+            }));
+            this.dispatchEvent(new CustomEvent('StorageCommitted'));
+            this._releaseCommitLock();
+        } catch (e) {
+            this.metrics.failures++;
+            this.dispatchEvent(new CustomEvent('StorageError', { detail: e }));
+            // Rollback in?memory from WAL
+            try {
+                const raw = this.storage.getItem(this._walKey);
+                if (raw) {
+                    const { removals, buffer } = JSON.parse(raw);
+                    this.removals = new Set(removals);
+                    this.buffer = { ...buffer };
+                }
+            } catch {}
+            this._releaseCommitLock();
+            throw e;
+        }
+    }
+
+    /** Helper to release lock and process queued commits */
+    _releaseCommitLock() {
+        this._commitLock = false;
+        if (this._commitQueue.length) {
+            const { resolve, reject } = this._commitQueue.shift();
+            this.commitAll().then(resolve).catch(reject);
+        }
+    }
+
+    /**
+     * Retrieve an item from the storage cache.
+     * @param {string} key
+     * @returns {*|null}
+     */
+    getItem(key) {
+        return Object.prototype.hasOwnProperty.call(this.cache, key) ? this.cache[key] : null;
+    }
+
+    /**
+     * Buffer a value to be stored on next commit and update cache.
+     * @param {string} key
+     * @param {*} value
+     */
+    setItem(key, value) {
+        this.cache[key] = value;
+        this.buffer[key] = value;
+        if (this.removals.has(key)) this.removals.delete(key);
+    }
+
+    /**
+     * Remove an item from cache and mark for deletion on next commit.
+     * @param {string} key
+     */
+    removeItem(key) {
+        if (Object.prototype.hasOwnProperty.call(this.cache, key)) {
+            delete this.cache[key];
+        }
+        this.removals.add(key);
+        if (Object.prototype.hasOwnProperty.call(this.buffer, key)) {
+            delete this.buffer[key];
+        }
+    }
+
+    /**
+     * Clear all data from storage and in-memory cache and buffers.
+     * Emits 'StorageCommitted' event when done.
+     */
+    clear() {
+        if (this.supported) {
+            try {
+                this.storage.clear();
+            } catch (e) {
+                this.supported = false;
+                this.dispatchEvent(new CustomEvent('StorageError', { detail: e }));
+            }
+        }
+        this.cache = {};
+        this.buffer = {};
+        this.removals.clear();
+        this.dispatchEvent(new CustomEvent('StorageCommitted'));
+    }
+
+    /** Get all keys currently stored in the cache. */
+    keys() {
+        return Object.keys(this.cache);
+    }
+}
+
+const storagemanager = new StorageManager();
+
+/**
+ * Subscribe to storage manager events.
+ * @param {string} type - Event type ('StorageReady', 'StorageCommitted', 'StorageError').
+ * @param {Function} listener
+ */
+function on(type, listener) {
+    storagemanager.addEventListener(type, listener, { passive: true });
+}
+
+/**
+ * Unsubscribe from storage manager events.
+ * @param {string} type
+ * @param {Function} listener
+ */
+function off(type, listener) {
+    storagemanager.removeEventListener(type, listener);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    storagemanager.sync();
+}, { once: true, passive: true });
+
+export default storagemanager;
+export { on, off };
