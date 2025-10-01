@@ -1,0 +1,29 @@
+stop() {
+    if (!this.isRunning && !this.isPaused) return;
+    try {
+        console.info('GameLoopManager: initiating shutdown');
+        // transition to stopped state
+        this.isRunning = false;
+        this.isPaused = false;
+        // cancel the RAF loop
+        if (this.rafId) {
+            cancelAnimationFrame(this.rafId);
+            this.rafId = null;
+        }
+        // remove paused state classes
+        const viewport = document.getElementById('canvas-viewport');
+        const hud = document.getElementById('hud-container');
+        if (viewport) viewport.classList.remove('is-paused');
+        if (hud) hud.classList.remove('is-paused');
+        // cleanup registered callbacks to prevent memory leaks
+        updateCallbacks.clear();
+        renderCallbacks.clear();
+        // analytics GameOver event
+        analyticstracker.logEvent('GameOver');
+        // final game-over event
+        document.dispatchEvent(new CustomEvent('GameOver'));
+        console.info('GameLoopManager: shutdown complete');
+    } catch (error) {
+        console.error('GameLoopManager: shutdown error', error);
+    }
+}
