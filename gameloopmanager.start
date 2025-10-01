@@ -1,0 +1,177 @@
+const updateCallbacks = new Set();
+const renderCallbacks = new Set();
+
+class GameLoopManager {
+    constructor() {
+        this.isRunning = false;
+        this.isPaused = false;
+        this.fixedStep = 1000 / 60;
+        this.maxDelta = this.fixedStep * 10;
+        this.rafId = null;
+        this.lastTimestamp = 0;
+        this.accumulatedDelta = 0;
+        this.tickCount = 0;
+        this.frameCount = 0;
+        this.fpsLastTime = 0;
+        this.fps = 0;
+        this._onStart = () => {};
+        this._onPause = () => {};
+        this._onStop = () => {};
+        this._onError = () => {};
+    }
+
+    start({
+        targetFPS = 60,
+        update = null,
+        render = null,
+        context = window,
+        onStart = () => {},
+        onPause = () => {},
+        onStop = () => {},
+        onError = () => {}
+    } = {}) {
+        if (this.isRunning) return;
+
+        // G1: DOM integrity checks
+        const viewport = document.getElementById('canvas-viewport');
+        const hud = document.getElementById('hud-container');
+        if (!viewport || !hud) {
+            const err = new Error('GameLoopManager.start: Missing #canvas-viewport or #hud-container');
+            onError(err);
+            return;
+        }
+
+        this._onStart = onStart;
+        this._onPause = onPause;
+        this._onStop = onStop;
+        this._onError = onError;
+
+        this.fixedStep = 1000 / targetFPS;
+        this.maxDelta = this.fixedStep * 10;
+        this.isRunning = true;
+        this.isPaused = false;
+        this.startTime = performance.now();
+        this.lastTimestamp = this.startTime;
+        this.accumulatedDelta = 0;
+        this.tickCount = 0;
+        this.frameCount = 0;
+        this.fpsLastTime = this.startTime;
+
+        if (update) {
+            if (Array.isArray(update)) update.forEach(fn => this.registerUpdate(fn));
+            else this.registerUpdate(update);
+        }
+        if (render) {
+            if (Array.isArray(render)) render.forEach(fn => this.registerRender(fn));
+            else this.registerRender(render);
+        }
+
+        document.dispatchEvent(new CustomEvent('GameStart'));
+        try { this._onStart(); } catch (e) { this._onError(e); }
+
+        const raf = context.requestAnimationFrame ? context.requestAnimationFrame.bind(context) : null;
+        const schedule = raf || ((cb) => setTimeout(() => cb(performance.now()), this.fixedStep));
+
+        const loop = (timestamp) => {
+            if (!this.isRunning) return;
+            const delta = timestamp - this.lastTimestamp;
+            this.lastTimestamp = timestamp;
+            const clamped = Math.min(delta, this.maxDelta);
+            this.accumulatedDelta += clamped;
+            while (this.accumulatedDelta >= this.fixedStep) {
+                updateCallbacks.forEach(fn => { try { fn(this.fixedStep); } catch (err) { this._onError(err); } });
+                this.accumulatedDelta -= this.fixedStep;
+                this.tickCount++;
+            }
+            renderCallbacks.forEach(fn => { try { fn(delta); } catch (err) { this._onError(err); } });
+            this.frameCount++;
+            if (timestamp - this.fpsLastTime >= 1000) {
+                this.fps = (this.frameCount * 1000) / (timestamp - this.fpsLastTime);
+                this.frameCount = 0;
+                this.fpsLastTime = timestamp;
+            }
+            this.rafId = schedule(loop);
+        };
+
+        this.rafId = schedule(loop);
+    }
+
+    pause() {
+        if (!this.isRunning || this.isPaused) return;
+        this.isPaused = true;
+        this.isRunning = false;
+        if (this.rafId !== null && typeof cancelAnimationFrame === 'function') {
+            cancelAnimationFrame(this.rafId);
+            this.rafId = null;
+        }
+        document.dispatchEvent(new CustomEvent('GamePause'));
+        try { this._onPause(); } catch (e) { this._onError(e); }
+        const viewport = document.getElementById('canvas-viewport');
+        const hud = document.getElementById('hud-container');
+        if (viewport) viewport.classList.add('is-paused');
+        if (hud) hud.classList.add('is-paused');
+    }
+
+    resume() {
+        if (this.isRunning || !this.isPaused) return;
+        this.isPaused = false;
+        this.isRunning = true;
+        this.lastTimestamp = performance.now();
+        this.fpsLastTime = this.lastTimestamp;
+        document.dispatchEvent(new CustomEvent('GameResume'));
+        const viewport = document.getElementById('canvas-viewport');
+        const hud = document.getElementById('hud-container');
+        if (viewport) viewport.classList.remove('is-paused');
+        if (hud) hud.classList.remove('is-paused');
+        // Note: loop scheduling continues from start's loop recursion
+    }
+
+    stop() {
+        if (!this.isRunning && !this.isPaused) return;
+        this.isRunning = false;
+        this.isPaused = false;
+        if (this.rafId !== null && typeof cancelAnimationFrame === 'function') {
+            cancelAnimationFrame(this.rafId);
+            this.rafId = null;
+        }
+        document.dispatchEvent(new CustomEvent('GameOver'));
+        try { this._onStop(); } catch (e) { this._onError(e); }
+        const viewport = document.getElementById('canvas-viewport');
+        const hud = document.getElementById('hud-container');
+        if (viewport) viewport.classList.remove('is-paused');
+        if (hud) hud.classList.remove('is-paused');
+    }
+
+    registerUpdate(fn) {
+        if (typeof fn === 'function') updateCallbacks.add(fn);
+    }
+
+    registerRender(fn) {
+        if (typeof fn === 'function') renderCallbacks.add(fn);
+    }
+
+    unregisterUpdate(fn) {
+        updateCallbacks.delete(fn);
+    }
+
+    unregisterRender(fn) {
+        renderCallbacks.delete(fn);
+    }
+
+    dispose() {
+        this.stop();
+        updateCallbacks.clear();
+        renderCallbacks.clear();
+    }
+
+    getCurrentFPS() {
+        return this.fps;
+    }
+
+    getTickCount() {
+        return this.tickCount;
+    }
+}
+
+const gameloopmanager = new GameLoopManager();
+export default gameloopmanager;
